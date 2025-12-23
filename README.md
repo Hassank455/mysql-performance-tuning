@@ -241,3 +241,150 @@ FROM user_info
 ORDER BY id DESC
 LIMIT 5;
 ```
+
+---
+
+## 🔍 EXPLAIN ANALYZE – Indexing Experiments (COUNT with filters)
+
+In this experiment, I tested how MySQL behaves when running the same query
+under different indexing strategies.
+
+Query under test:
+
+```sql
+EXPLAIN ANALYZE
+SELECT COUNT(*)
+FROM user_info
+WHERE `name` = 'User_1000' AND state_id = 0;
+````
+
+---
+
+### 1️⃣ Baseline – No Index
+
+```sql
+EXPLAIN ANALYZE
+SELECT COUNT(*)
+FROM user_info
+WHERE `name` = 'User_1000' AND state_id = 0;
+```
+
+Execution plan:
+
+```text
+-> Aggregate: count(0)  (cost=532807 rows=1) (actual time=955..955 rows=1 loops=1)
+    -> Filter: ((user_info.state_id = 0) and (user_info.`name` = 'User_1000'))
+        (cost=521626 rows=48525) (actual time=2.39..955 rows=1 loops=1)
+        -> Table scan on user_info
+           (cost=521626 rows=4.85e+6) (actual time=0.77..838 rows=5e+6 loops=1)
+```
+
+Notes:
+
+* MySQL performed a full table scan.
+* Around 5 million rows were scanned.
+* This represents the slowest possible scenario.
+
+---
+
+### 2️⃣ Index on `state_id`
+
+```sql
+ALTER TABLE user_info ADD INDEX state_id_idx(state_id);
+
+EXPLAIN ANALYZE
+SELECT COUNT(*)
+FROM user_info
+WHERE `name` = 'User_1000' AND state_id = 0;
+```
+
+Execution plan:
+
+```text
+-> Aggregate: count(0)  (cost=119641 rows=1) (actual time=280..280 rows=1 loops=1)
+    -> Filter: (user_info.`name` = 'User_1000')
+        (cost=114802 rows=21002) (actual time=1.34..280 rows=1 loops=1)
+        -> Index lookup on user_info using state_id_idx (state_id = 0)
+           (cost=114802 rows=210022) (actual time=1.31..273 rows=100000 loops=1)
+```
+
+Notes:
+
+* MySQL used the `state_id_idx` index to narrow down rows.
+* Filtering by `name` happened after the index lookup.
+* Performance improved compared to full table scan, but many rows were still examined.
+
+---
+
+### 3️⃣ Index on `name` (Single-column Index)
+
+```sql
+ALTER TABLE user_info ADD INDEX name_idx(name);
+
+EXPLAIN ANALYZE
+SELECT COUNT(*)
+FROM user_info
+WHERE `name` = 'User_1000' AND state_id = 0;
+```
+
+Execution plan:
+
+```text
+-> Aggregate: count(0)  (cost=1.01 rows=1) (actual time=0.252..0.252 rows=1 loops=1)
+    -> Filter: (user_info.state_id = 0)
+        (cost=1 rows=0.05) (actual time=0.244..0.246 rows=1 loops=1)
+        -> Index lookup on user_info using name_idx (name = 'User_1000')
+           (cost=1 rows=1) (actual time=0.241..0.243 rows=1 loops=1)
+```
+
+Notes:
+
+* MySQL chose the `name_idx` index due to high selectivity.
+* Only one row was retrieved from the index.
+* `state_id` was checked after fetching the row.
+* Performance improved significantly.
+
+---
+
+### 4️⃣ Composite Index on (`name`, `state_id`)
+
+```sql
+DROP INDEX name_idx ON user_info;
+DROP INDEX state_id_idx ON user_info;
+
+ALTER TABLE user_info ADD INDEX name_state_id_idx(name, state_id);
+
+EXPLAIN ANALYZE
+SELECT COUNT(*)
+FROM user_info
+WHERE `name` = 'User_1000' AND state_id = 0;
+```
+
+Execution plan:
+
+```text
+-> Aggregate: count(0)  (cost=1.33 rows=1) (actual time=0.0972..0.0974 rows=1 loops=1)
+    -> Covering index lookup on user_info using name_state_id_idx
+       (name = 'User_1000', state_id = 0)
+       (cost=1.1 rows=1) (actual time=0.0837..0.0885 rows=1 loops=1)
+```
+
+Notes:
+
+* MySQL used a covering index lookup.
+* Both conditions were satisfied directly from the index.
+* No additional table row lookup was needed.
+* This was the fastest execution among all scenarios.
+
+---
+
+### ✅ Summary of Observations
+
+* No index → full table scan (slowest).
+* Index on `state_id` → partial improvement, still scans many rows.
+* Index on `name` → very fast due to high selectivity.
+* Composite index (`name`, `state_id`) → best result for this query pattern,
+  using a covering index and minimal row access.
+
+
+---
