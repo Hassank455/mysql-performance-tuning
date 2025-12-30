@@ -163,6 +163,7 @@ A stored procedure was created to generate large datasets
 in a controlled and repeatable way.
 
 This procedure supports:
+
 - Inserting millions of rows
 - Batch-based inserts
 - Transaction control
@@ -233,6 +234,7 @@ CALL seed_user_info(5000000, 10000);
 ```
 
 Verification queries:
+
 ```sql
 SELECT COUNT(*) FROM user_info;
 
@@ -256,7 +258,7 @@ EXPLAIN ANALYZE
 SELECT COUNT(*)
 FROM user_info
 WHERE `name` = 'User_1000' AND state_id = 0;
-````
+```
 
 ---
 
@@ -281,9 +283,9 @@ Execution plan:
 
 Notes:
 
-* MySQL performed a full table scan.
-* Around 5 million rows were scanned.
-* This represents the slowest possible scenario.
+- MySQL performed a full table scan.
+- Around 5 million rows were scanned.
+- This represents the slowest possible scenario.
 
 ---
 
@@ -310,9 +312,9 @@ Execution plan:
 
 Notes:
 
-* MySQL used the `state_id_idx` index to narrow down rows.
-* Filtering by `name` happened after the index lookup.
-* Performance improved compared to full table scan, but many rows were still examined.
+- MySQL used the `state_id_idx` index to narrow down rows.
+- Filtering by `name` happened after the index lookup.
+- Performance improved compared to full table scan, but many rows were still examined.
 
 ---
 
@@ -339,10 +341,10 @@ Execution plan:
 
 Notes:
 
-* MySQL chose the `name_idx` index due to high selectivity.
-* Only one row was retrieved from the index.
-* `state_id` was checked after fetching the row.
-* Performance improved significantly.
+- MySQL chose the `name_idx` index due to high selectivity.
+- Only one row was retrieved from the index.
+- `state_id` was checked after fetching the row.
+- Performance improved significantly.
 
 ---
 
@@ -371,20 +373,181 @@ Execution plan:
 
 Notes:
 
-* MySQL used a covering index lookup.
-* Both conditions were satisfied directly from the index.
-* No additional table row lookup was needed.
-* This was the fastest execution among all scenarios.
+- MySQL used a covering index lookup.
+- Both conditions were satisfied directly from the index.
+- No additional table row lookup was needed.
+- This was the fastest execution among all scenarios.
 
 ---
 
 ### ✅ Summary of Observations
 
-* No index → full table scan (slowest).
-* Index on `state_id` → partial improvement, still scans many rows.
-* Index on `name` → very fast due to high selectivity.
-* Composite index (`name`, `state_id`) → best result for this query pattern,
+- No index → full table scan (slowest).
+- Index on `state_id` → partial improvement, still scans many rows.
+- Index on `name` → very fast due to high selectivity.
+- Composite index (`name`, `state_id`) → best result for this query pattern,
   using a covering index and minimal row access.
 
+---
+
+## 🔬 Query Profiling Using Performance Schema & sys Schema
+
+Beyond analyzing single queries with `EXPLAIN ANALYZE`,
+it is critical to understand **how queries behave over time** under real workloads.
+
+MySQL provides two powerful internal schemas for this purpose:
+
+- `performance_schema` → low-level execution statistics
+- `sys` → human-readable views built on top of `performance_schema`
+
+These tools allow identifying:
+
+- The most expensive queries overall
+- Queries executed too frequently
+- Full table scans and missing indexes
+- Lock contention and I/O pressure
+
+##
+
+### 📊 Identifying Top Time-Consuming Queries
+
+To detect the queries responsible for most of the database load,
+we analyze aggregated execution statistics using
+`events_statements_summary_by_digest`.
+
+Queries are normalized (digest-based), allowing us to group
+logically identical queries that differ only by literal values.
+
+```sql
+SELECT
+  (100 * SUM_TIMER_WAIT / SUM(SUM_TIMER_WAIT) OVER()) AS percent,
+  SUM_TIMER_WAIT AS total,
+  COUNT_STAR AS calls,
+  AVG_TIMER_WAIT AS mean,
+  SUBSTRING(DIGEST_TEXT, 1, 75) AS digest_preview,
+  DIGEST_TEXT
+FROM performance_schema.events_statements_summary_by_digest
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 10;
+```
 
 ---
+
+### Interpretation of the columns
+
+**Key columns explained:**
+
+| Column           | Description                                           |
+| ---------------- | ----------------------------------------------------- |
+| `DIGEST_TEXT`    | Normalized form of the SQL query                      |
+| `COUNT_STAR`     | Number of times the query was executed                |
+| `SUM_TIMER_WAIT` | Total accumulated execution time                      |
+| `AVG_TIMER_WAIT` | Average execution time per call                       |
+| `percent`        | Percentage contribution to total query execution time |
+
+> 🔍 **Insight**
+>
+> A query does not need to be slow to be expensive.
+> A frequently executed fast query can consume more total time
+> than a rarely executed slow one.
+
+##
+
+### 🔒 Lock Contention & Temporary Table Analysis
+
+Additional performance indicators help identify deeper problems
+related to locking, sorting, and grouping behavior.
+
+| Column                        | Meaning                             | When to Investigate                    |
+| ----------------------------- | ----------------------------------- | -------------------------------------- |
+| `SUM_LOCK_TIME`               | Total time spent waiting for locks  | High contention or long transactions   |
+| `SUM_CREATED_TMP_TABLES`      | Temp tables created (memory + disk) | Heavy GROUP BY / ORDER BY              |
+| `SUM_CREATED_TMP_DISK_TABLES` | Temp tables created on disk         | Insufficient memory or missing indexes |
+| `SUM_SORT_MERGE_PASSES`       | Number of sort merge passes         | Sort buffer too small                  |
+| `SUM_ROWS_EXAMINED`           | Rows scanned by the query           | Inefficient access path                |
+| `SUM_ROWS_SENT`               | Rows returned to client             | Large result sets                      |
+
+##
+
+### 🚨 Detecting Full Table Scans
+
+The `sys` schema provides simplified views for identifying
+queries and tables that rely on full table scans.
+
+```sql
+SELECT *
+FROM sys.statements_with_full_table_scans
+ORDER BY no_index_used_count DESC;
+```
+
+```sql
+SELECT *
+FROM sys.schema_tables_with_full_table_scans;
+```
+
+> ⚠️ **Warning**
+>
+> Frequent full table scans on large tables often indicate
+> missing or ineffective indexes.
+
+##
+
+### 📈 Index Usage Analysis
+
+To verify whether indexes are actually being used,
+we inspect index-level I/O statistics.
+
+```sql
+SELECT
+  object_schema,
+  object_name,
+  index_name,
+  count_star
+FROM performance_schema.table_io_waits_summary_by_index_usage
+WHERE object_name = 'user_info';
+```
+
+**Interpretation:**
+
+- High `count_star` → index heavily used
+- Low or NULL `index_name` → possible table scans
+
+##
+
+### 📂 Table I/O Activity
+
+Table-level I/O statistics reveal how often rows are read and fetched.
+
+```sql
+SELECT *
+FROM performance_schema.table_io_waits_summary_by_table
+WHERE object_name = 'user_info';
+```
+
+Key indicators:
+
+- `COUNT_READ` → number of read operations
+- `COUNT_FETCH` → number of row fetches
+
+##
+
+### ❌ Error & Deadlock Monitoring
+
+```sql
+SELECT *
+FROM performance_schema.events_errors_summary_by_account_by_error
+WHERE error_name = 'er_lock_deadlock';
+```
+
+
+This helps detect concurrency issues such as:
+- Deadlocks
+- Conflicting transaction order
+
+## ✅ Key Takeaways
+
+- Performance issues must be analyzed over time, not per query only
+- High-frequency queries can dominate total execution time
+- Temporary disk tables are a strong signal of suboptimal queries
+- Index existence does not guarantee index usage
+- `performance_schema` + `sys` provide production-grade observability
