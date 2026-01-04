@@ -551,3 +551,140 @@ This helps detect concurrency issues such as:
 - Temporary disk tables are a strong signal of suboptimal queries
 - Index existence does not guarantee index usage
 - `performance_schema` + `sys` provide production-grade observability
+
+---
+
+## 🧠 InnoDB Buffer Pool Tuning & Hit Rate Analysis
+
+The InnoDB Buffer Pool is the most critical memory structure in MySQL.
+It caches table data and indexes in memory to minimize disk I/O
+and directly impacts query latency and throughput.
+
+---
+
+### 🔍 Checking Buffer Pool Size
+
+```sql
+SHOW GLOBAL VARIABLES LIKE 'innodb_buffer_pool_size';
+````
+
+The default value (128 MiB) is usually insufficient for real workloads
+and should be increased based on available system memory.
+
+---
+
+### 📊 Measuring Buffer Pool Hit Rate
+
+The Buffer Pool Hit Rate indicates how often data is served from memory
+instead of disk.
+
+**Formula:**
+
+```
+Hit Rate = 100 × (1 − Innodb_buffer_pool_reads / Innodb_buffer_pool_read_requests)
+```
+
+**Metrics query:**
+
+```sql
+SELECT Variable_name, Variable_value
+FROM sys.metrics
+WHERE Variable_name IN (
+  'Innodb_buffer_pool_reads',
+  'Innodb_buffer_pool_read_requests'
+);
+```
+
+**Example calculation:**
+
+```sql
+SELECT 100 - (100 * 1510 / 25837) AS HitRate;
+```
+
+Result:
+
+```
+HitRate = 94.15%
+```
+
+---
+
+### 🧠 Interpretation
+
+* A hit rate close to **100%** means most reads are served from memory
+* Lower hit rates indicate increased disk I/O
+* In practice, achieving 100% is not always possible if the dataset
+  exceeds available memory
+
+> 🔍 **Note**
+> Buffer pool metrics are cumulative since server startup.
+> For accurate analysis, hit rate should ideally be calculated
+> using deltas over a time window.
+
+---
+
+### ⚙️ Increasing Buffer Pool Size
+
+To increase the buffer pool size at runtime:
+
+```sql
+SET GLOBAL innodb_buffer_pool_size = 1073741824; -- 1 GB
+```
+
+To persist the configuration across restarts (MySQL 8.0+):
+
+```sql
+SET PERSIST innodb_buffer_pool_size = 1073741824;
+```
+
+Verification:
+
+```sql
+SHOW GLOBAL VARIABLES LIKE 'innodb_buffer_pool_size';
+```
+
+---
+
+### 🧩 Buffer Pool Instances
+
+The buffer pool can be internally split into multiple instances
+to reduce contention under high concurrency.
+
+```sql
+SHOW GLOBAL VARIABLES LIKE 'innodb_buffer_pool_instances';
+```
+
+In modern MySQL versions, this value is typically auto-sized
+based on the buffer pool size.
+
+---
+
+### 🚀 I/O Capacity Tuning
+
+InnoDB background flushing behavior is controlled by I/O capacity variables.
+
+```sql
+SHOW GLOBAL VARIABLES LIKE 'innodb_io_capacity';
+SHOW GLOBAL VARIABLES LIKE 'innodb_io_capacity_max';
+```
+
+Adjusting I/O capacity for fast storage (SSD/NVMe):
+
+```sql
+SET PERSIST innodb_io_capacity = 1000;
+```
+
+This allows InnoDB to flush dirty pages more aggressively
+when storage can sustain higher I/O throughput.
+
+---
+
+### 📌 Key Takeaways
+
+* Buffer Pool size has the highest impact on MySQL performance
+* Hit Rate is a strong indicator of memory efficiency
+* Increasing buffer pool size reduces disk reads but must be balanced
+  against total system memory
+* I/O capacity tuning should reflect actual storage capabilities
+
+---
